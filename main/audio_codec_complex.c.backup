@@ -1,0 +1,300 @@
+#include "audio_codec.h"
+#include <esp_log.h>
+#include <esp_err.h>
+#include <driver/i2s_std.h>
+#include <driver/i2c_master.h>
+#include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <string.h>
+
+static const char *TAG = "AUDIO_CODEC";
+
+// ES8311 I2C address
+#define ES8311_I2C_ADDR     0x18
+
+// ES8311 register definitions (simplified)
+#define ES8311_REG_RESET        0x00
+#define ES8311_REG_CLOCK_MANAGER 0x01
+#define ES8311_REG_ANALOG_CONF  0x0A
+#define ES8311_REG_SYSTEM       0x0D
+#define ES8311_REG_DAC_CONF     0x16
+#define ES8311_REG_DAC_VOLUME   0x17
+
+// Audio codec structure
+struct audio_codec_s {
+    audio_codec_config_t config;
+    i2s_chan_handle_t tx_handle;
+    i2c_master_dev_handle_t i2c_dev;
+    bool initialized;
+    bool playing;
+};
+
+static esp_err_t es8311_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value) {
+    uint8_t write_buf[2] = {reg, value};
+    return i2c_master_transmit(dev, write_buf, sizeof(write_buf), 1000);
+}
+
+static esp_err_t es8311_init_codec(audio_codec_handle_t codec) {
+    ESP_LOGI(TAG, "🎵 Initializing ES8311 codec...");
+    
+    // Reset codec
+    esp_err_t ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_RESET, 0x80);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to reset ES8311");
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    // Exit reset mode
+    ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_RESET, 0x00);
+    if (ret != ESP_OK) return ret;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    // Configure clock management - enable internal clock
+    ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_CLOCK_MANAGER, 0x01);
+    if (ret != ESP_OK) return ret;
+    
+    // Configure system - enable reference voltage
+    ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_SYSTEM, 0x05);
+    if (ret != ESP_OK) return ret;
+    
+    // Configure analog - enable DAC and output
+    ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_ANALOG_CONF, 0xF0);
+    if (ret != ESP_OK) return ret;
+    
+    // Configure DAC - enable DAC and set format
+    ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_DAC_CONF, 0x18);
+    if (ret != ESP_OK) return ret;
+    
+    // Set initial volume (0-255, where 0 is max volume)
+    uint8_t volume_reg = (100 - codec->config.volume) * 255 / 100;
+    ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_DAC_VOLUME, volume_reg);
+    if (ret != ESP_OK) return ret;
+    
+    ESP_LOGI(TAG, "✅ ES8311 codec initialized successfully - Volume: %d%%", codec->config.volume);
+    ESP_LOGI(TAG, "🔊 PA GPIO: %d, MCLK: %d, BCLK: %d, WS: %d", 
+             codec->config.pa_gpio, codec->config.mclk_gpio, 
+             codec->config.bclk_gpio, codec->config.ws_gpio);
+    return ESP_OK;
+}
+
+audio_codec_handle_t audio_codec_init(const audio_codec_config_t* config) {
+    if (!config) {
+        ESP_LOGE(TAG, "Invalid configuration");
+        return NULL;
+    }
+    
+    ESP_LOGI(TAG, "🔊 Initializing audio codec...");
+    
+    audio_codec_handle_t codec = calloc(1, sizeof(struct audio_codec_s));
+    if (!codec) {
+        ESP_LOGE(TAG, "Failed to allocate memory for codec");
+        return NULL;
+    }
+    
+    memcpy(&codec->config, config, sizeof(audio_codec_config_t));
+    
+    // Configure power amplifier GPIO
+    if (config->pa_gpio >= 0) {
+        gpio_config_t io_conf = {
+            .intr_type = GPIO_INTR_DISABLE,
+            .mode = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = (1ULL << config->pa_gpio),
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(config->pa_gpio, 0);  // Start with PA disabled
+    }
+    
+    // Initialize I2C master for codec control
+    ESP_LOGI(TAG, "🔧 Creating I2C master bus on port 0...");
+    i2c_master_bus_config_t i2c_bus_conf = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .scl_io_num = config->scl_gpio,
+        .sda_io_num = config->sda_gpio,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    
+    i2c_master_bus_handle_t i2c_bus_handle;
+    esp_err_t ret = i2c_new_master_bus(&i2c_bus_conf, &i2c_bus_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to create I2C master bus: %s", esp_err_to_name(ret));
+        free(codec);
+        return NULL;
+    }
+    ESP_LOGI(TAG, "✅ I2C master bus created successfully");
+    
+    i2c_device_config_t i2c_dev_conf = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = ES8311_I2C_ADDR,
+        .scl_speed_hz = 100000,  // 100kHz
+    };
+    
+    ESP_LOGI(TAG, "🔧 Adding ES8311 device to I2C bus...");
+    ret = i2c_master_bus_add_device(i2c_bus_handle, &i2c_dev_conf, &codec->i2c_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to add I2C device: %s", esp_err_to_name(ret));
+        free(codec);
+        return NULL;
+    }
+    ESP_LOGI(TAG, "✅ ES8311 I2C device added successfully");
+    
+    // Initialize I2S for audio output
+    ESP_LOGI(TAG, "🔧 Creating I2S channel...");
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    ret = i2s_new_channel(&chan_cfg, &codec->tx_handle, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to create I2S channel: %s", esp_err_to_name(ret));
+        free(codec);
+        return NULL;
+    }
+    ESP_LOGI(TAG, "✅ I2S channel created successfully");
+    
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(config->sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            config->bits_per_sample == 16 ? I2S_DATA_BIT_WIDTH_16BIT : I2S_DATA_BIT_WIDTH_24BIT,
+            config->channels == 1 ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO
+        ),
+        .gpio_cfg = {
+            .mclk = config->mclk_gpio,
+            .bclk = config->bclk_gpio,
+            .ws = config->ws_gpio,
+            .dout = config->dout_gpio,
+            .din = config->din_gpio,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    
+    ret = i2s_channel_init_std_mode(codec->tx_handle, &std_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize I2S channel");
+        i2s_del_channel(codec->tx_handle);
+        free(codec);
+        return NULL;
+    }
+    
+    // Initialize the ES8311 codec
+    ret = es8311_init_codec(codec);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize ES8311 codec");
+        i2s_del_channel(codec->tx_handle);
+        free(codec);
+        return NULL;
+    }
+    
+    codec->initialized = true;
+    ESP_LOGI(TAG, "✅ Audio codec initialized successfully");
+    return codec;
+}
+
+esp_err_t audio_codec_start(audio_codec_handle_t codec) {
+    if (!codec || !codec->initialized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "🎵 Starting audio codec...");
+    
+    // Enable power amplifier - CRITICAL for audio output
+    if (codec->config.pa_gpio >= 0) {
+        ESP_LOGI(TAG, "🔊 Enabling Power Amplifier on GPIO%d", codec->config.pa_gpio);
+        gpio_set_level(codec->config.pa_gpio, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));  // Longer PA startup delay
+    }
+    
+    // Enable I2S channel
+    esp_err_t ret = i2s_channel_enable(codec->tx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable I2S channel");
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "✅ Audio codec started");
+    return ESP_OK;
+}
+
+esp_err_t audio_codec_stop(audio_codec_handle_t codec) {
+    if (!codec || !codec->initialized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "🛑 Stopping audio codec...");
+    
+    // Disable I2S channel
+    esp_err_t ret = i2s_channel_disable(codec->tx_handle);
+    
+    // Disable power amplifier
+    if (codec->config.pa_gpio >= 0) {
+        gpio_set_level(codec->config.pa_gpio, 0);
+    }
+    
+    codec->playing = false;
+    ESP_LOGI(TAG, "✅ Audio codec stopped");
+    return ret;
+}
+
+esp_err_t audio_codec_deinit(audio_codec_handle_t codec) {
+    if (!codec) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "🗑️ Deinitializing audio codec...");
+    
+    if (codec->initialized) {
+        audio_codec_stop(codec);
+        i2s_del_channel(codec->tx_handle);
+    }
+    
+    free(codec);
+    ESP_LOGI(TAG, "✅ Audio codec deinitialized");
+    return ESP_OK;
+}
+
+esp_err_t audio_codec_set_volume(audio_codec_handle_t codec, int volume) {
+    if (!codec || !codec->initialized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    
+    codec->config.volume = volume;
+    
+    // Update ES8311 volume register (0 = max volume, 255 = min volume)
+    uint8_t volume_reg = (100 - volume) * 255 / 100;
+    esp_err_t ret = es8311_write_reg(codec->i2c_dev, ES8311_REG_DAC_VOLUME, volume_reg);
+    
+    ESP_LOGI(TAG, "🔊 Volume set to %d%%", volume);
+    return ret;
+}
+
+int audio_codec_play_data(audio_codec_handle_t codec, const void* data, size_t length, uint32_t timeout_ms) {
+    if (!codec || !codec->initialized || !data) {
+        return -1;
+    }
+    
+    codec->playing = true;
+    
+    size_t bytes_written = 0;
+    esp_err_t ret = i2s_channel_write(codec->tx_handle, data, length, &bytes_written, 
+                                     pdMS_TO_TICKS(timeout_ms));
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write audio data: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    
+    return bytes_written;
+}
+
+bool audio_codec_is_playing(audio_codec_handle_t codec) {
+    return codec && codec->playing;
+}

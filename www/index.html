@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Alarm Clock</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class='container'>
+        <div class='header'>
+            <h1>Alarm Clock Configuration</h1>
+            <div class='status-bar'>
+                <div id='currentTime'>Loading...</div>
+                <div id='batteryStatus' class='battery-status'>
+                    <div id='batteryIcon' class='battery-icon'>Battery</div>
+                    <span id='batteryPercentage'>--</span>%
+                </div>
+            </div>
+        </div>
+        <div id='alarmsContainer'></div>
+        <div class='alarm-controls'>
+            <button class='add-btn' onclick='addAlarm()'>+ Add New Alarm</button>
+            <button class='save-btn' onclick='saveAlarms()'>Save All Alarms</button>
+        </div>
+        
+        <div class='sound-section'>
+            <h2>Sound Configuration</h2>
+            <div class='volume-control'>
+                <label for='volumeSlider'>Volume: <span id='volumeValue'>80</span>%</label>
+                <input type='range' id='volumeSlider' class='volume-slider' 
+                       min='0' max='100' value='80' onchange='setVolume(this.value)'>
+            </div>
+            <div class='sound-controls'>
+                <div class='sound-item'>
+                    <span>PCM Welcome Beeps (Synthesized)</span>
+                    <button class='test-sound-btn' onclick='playSound("welcome")'>Test PCM</button>
+                </div>
+                <div class='sound-item'>
+                    <span>OGG Welcome (Greeting Sound)</span>
+                    <button class='test-sound-btn' onclick='playSound("welcome_ogg")'>Test OGG</button>
+                </div>
+                <div class='sound-item'>
+                    <span>Test Tone (1kHz sine wave)</span>
+                    <button class='test-sound-btn' onclick='playSound("tone")'>Test Tone</button>
+                </div>
+            </div>
+        </div>
+        
+        <div id='status' class='status'></div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>

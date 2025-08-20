@@ -19,3 +19,7 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
 
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Language configuration - set to en-US by default
+# Change to "es-ES" for Spanish language support
+CONFIG_LANGUAGE="en-US"
